@@ -12,6 +12,9 @@
 (define-data-var next-shelter-id uint u0)
 (define-data-var next-donor-id uint u0)
 (define-data-var next-match-id uint u0)
+(define-data-var next-volunteer-id uint u0)
+(define-data-var next-opportunity-id uint u0)
+(define-data-var next-volunteer-assignment-id uint u0)
 (define-data-var total-donations uint u0)
 (define-data-var platform-fee-rate uint u25)
 
@@ -242,6 +245,303 @@
       (try! (as-contract (stx-transfer? balance tx-sender (get owner shelter))))
       (map-set shelters shelter-id (merge shelter {funding-received: u0}))
       (ok balance))))
+
+(define-map volunteers
+  uint
+  {
+    address: principal,
+    name: (string-ascii 100),
+    email: (string-ascii 100),
+    phone: (string-ascii 20),
+    skills: (list 10 (string-ascii 50)),
+    availability: (string-ascii 200),
+    total-hours: uint,
+    assignments-count: uint,
+    rating: uint,
+    active: bool,
+    created-at: uint,
+    background-checked: bool
+  }
+)
+
+(define-map volunteer-opportunities
+  uint
+  {
+    shelter-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    required-skills: (list 5 (string-ascii 50)),
+    time-commitment: uint,
+    max-volunteers: uint,
+    current-volunteers: uint,
+    urgent: bool,
+    active: bool,
+    created-at: uint,
+    deadline: (optional uint),
+    contact-person: (string-ascii 100)
+  }
+)
+
+(define-map volunteer-assignments
+  uint
+  {
+    volunteer-id: uint,
+    opportunity-id: uint,
+    shelter-id: uint,
+    status: (string-ascii 20),
+    hours-committed: uint,
+    hours-completed: uint,
+    assigned-at: uint,
+    completed-at: (optional uint),
+    rating-from-shelter: (optional uint),
+    rating-from-volunteer: (optional uint),
+    feedback: (string-ascii 500)
+  }
+)
+
+(define-map volunteer-achievements
+  {volunteer-id: uint, achievement-type: (string-ascii 50)}
+  {
+    earned-at: uint,
+    description: (string-ascii 200),
+    hours-milestone: uint
+  }
+)
+
+(define-public (register-volunteer
+  (name (string-ascii 100))
+  (email (string-ascii 100))
+  (phone (string-ascii 20))
+  (skills (list 10 (string-ascii 50)))
+  (availability (string-ascii 200)))
+  (let ((volunteer-id (var-get next-volunteer-id)))
+    (map-set volunteers volunteer-id
+      {
+        address: tx-sender,
+        name: name,
+        email: email,
+        phone: phone,
+        skills: skills,
+        availability: availability,
+        total-hours: u0,
+        assignments-count: u0,
+        rating: u0,
+        active: true,
+        created-at: stacks-block-height,
+        background-checked: false
+      })
+    (var-set next-volunteer-id (+ volunteer-id u1))
+    (ok volunteer-id)))
+
+(define-public (create-volunteer-opportunity
+  (shelter-id uint)
+  (title (string-ascii 100))
+  (description (string-ascii 500))
+  (required-skills (list 5 (string-ascii 50)))
+  (time-commitment uint)
+  (max-volunteers uint)
+  (urgent bool)
+  (deadline (optional uint))
+  (contact-person (string-ascii 100)))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found))
+        (opportunity-id (var-get next-opportunity-id)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (get verified shelter) err-not-verified)
+    (asserts! (> max-volunteers u0) err-invalid-capacity)
+    (asserts! (> time-commitment u0) err-invalid-amount)
+    (map-set volunteer-opportunities opportunity-id
+      {
+        shelter-id: shelter-id,
+        title: title,
+        description: description,
+        required-skills: required-skills,
+        time-commitment: time-commitment,
+        max-volunteers: max-volunteers,
+        current-volunteers: u0,
+        urgent: urgent,
+        active: true,
+        created-at: stacks-block-height,
+        deadline: deadline,
+        contact-person: contact-person
+      })
+    (var-set next-opportunity-id (+ opportunity-id u1))
+    (ok opportunity-id)))
+
+(define-public (apply-for-volunteer-opportunity
+  (volunteer-id uint)
+  (opportunity-id uint)
+  (hours-committed uint))
+  (let ((volunteer (unwrap! (map-get? volunteers volunteer-id) err-not-found))
+        (opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) err-not-found))
+        (assignment-id (var-get next-volunteer-assignment-id)))
+    (asserts! (is-eq (get address volunteer) tx-sender) err-unauthorized)
+    (asserts! (get active volunteer) err-not-found)
+    (asserts! (get active opportunity) err-not-found)
+    (asserts! (< (get current-volunteers opportunity) (get max-volunteers opportunity)) err-shelter-full)
+    (asserts! (> hours-committed u0) err-invalid-amount)
+    (map-set volunteer-assignments assignment-id
+      {
+        volunteer-id: volunteer-id,
+        opportunity-id: opportunity-id,
+        shelter-id: (get shelter-id opportunity),
+        status: "pending",
+        hours-committed: hours-committed,
+        hours-completed: u0,
+        assigned-at: stacks-block-height,
+        completed-at: none,
+        rating-from-shelter: none,
+        rating-from-volunteer: none,
+        feedback: ""
+      })
+    (var-set next-volunteer-assignment-id (+ assignment-id u1))
+    (ok assignment-id)))
+
+(define-public (approve-volunteer-assignment (assignment-id uint))
+  (let ((assignment (unwrap! (map-get? volunteer-assignments assignment-id) err-not-found))
+        (opportunity-id (get opportunity-id assignment))
+        (volunteer-id (get volunteer-id assignment)))
+    (let ((opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) err-not-found))
+          (shelter (unwrap! (map-get? shelters (get shelter-id opportunity)) err-not-found)))
+      (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+      (asserts! (is-eq (get status assignment) "pending") err-unauthorized)
+      (map-set volunteer-assignments assignment-id
+        (merge assignment {status: "approved"}))
+      (map-set volunteer-opportunities opportunity-id
+        (merge opportunity {current-volunteers: (+ (get current-volunteers opportunity) u1)}))
+      (let ((volunteer (unwrap! (map-get? volunteers volunteer-id) err-not-found)))
+        (map-set volunteers volunteer-id
+          (merge volunteer {assignments-count: (+ (get assignments-count volunteer) u1)}))
+        (ok true)))))
+
+(define-public (complete-volunteer-assignment
+  (assignment-id uint)
+  (hours-completed uint)
+  (rating-from-shelter uint)
+  (feedback (string-ascii 500)))
+  (let ((assignment (unwrap! (map-get? volunteer-assignments assignment-id) err-not-found))
+        (volunteer-id (get volunteer-id assignment))
+        (opportunity-id (get opportunity-id assignment)))
+    (let ((opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) err-not-found))
+          (shelter (unwrap! (map-get? shelters (get shelter-id opportunity)) err-not-found)))
+      (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+      (asserts! (is-eq (get status assignment) "approved") err-unauthorized)
+      (asserts! (> hours-completed u0) err-invalid-amount)
+      (asserts! (and (>= rating-from-shelter u1) (<= rating-from-shelter u5)) err-invalid-amount)
+      (map-set volunteer-assignments assignment-id
+        (merge assignment {
+          status: "completed",
+          hours-completed: hours-completed,
+          completed-at: (some stacks-block-height),
+          rating-from-shelter: (some rating-from-shelter),
+          feedback: feedback
+        }))
+      (let ((volunteer (unwrap! (map-get? volunteers volunteer-id) err-not-found)))
+        (let ((new-total-hours (+ (get total-hours volunteer) hours-completed))
+              (new-rating (/ (+ (* (get rating volunteer) (get assignments-count volunteer)) rating-from-shelter) 
+                            (+ (get assignments-count volunteer) u1))))
+          (map-set volunteers volunteer-id
+            (merge volunteer {
+              total-hours: new-total-hours,
+              rating: new-rating
+            }))
+          (try! (award-volunteer-achievement volunteer-id new-total-hours))
+          (ok true))))))
+
+(define-public (rate-volunteer-experience
+  (assignment-id uint)
+  (rating-from-volunteer uint))
+  (let ((assignment (unwrap! (map-get? volunteer-assignments assignment-id) err-not-found))
+        (volunteer-id (get volunteer-id assignment)))
+    (let ((volunteer (unwrap! (map-get? volunteers volunteer-id) err-not-found)))
+      (asserts! (is-eq (get address volunteer) tx-sender) err-unauthorized)
+      (asserts! (is-eq (get status assignment) "completed") err-unauthorized)
+      (asserts! (and (>= rating-from-volunteer u1) (<= rating-from-volunteer u5)) err-invalid-amount)
+      (map-set volunteer-assignments assignment-id
+        (merge assignment {rating-from-volunteer: (some rating-from-volunteer)}))
+      (ok true))))
+
+(define-public (background-check-volunteer (volunteer-id uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (match (map-get? volunteers volunteer-id)
+      volunteer (begin
+        (map-set volunteers volunteer-id (merge volunteer {background-checked: true}))
+        (ok true))
+      err-not-found)))
+
+(define-public (deactivate-volunteer-opportunity (opportunity-id uint))
+  (let ((opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) err-not-found)))
+    (let ((shelter (unwrap! (map-get? shelters (get shelter-id opportunity)) err-not-found)))
+      (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+      (map-set volunteer-opportunities opportunity-id
+        (merge opportunity {active: false}))
+      (ok true))))
+
+(define-private (award-volunteer-achievement (volunteer-id uint) (total-hours uint))
+  (let ((volunteer (unwrap! (map-get? volunteers volunteer-id) err-not-found)))
+    (if (and (>= total-hours u50) (is-none (map-get? volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "50-hours"})))
+      (begin
+        (map-set volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "50-hours"}
+          {
+            earned-at: stacks-block-height,
+            description: "Dedicated Volunteer - 50+ hours of service",
+            hours-milestone: u50
+          })
+        (ok true))
+      (if (and (>= total-hours u100) (is-none (map-get? volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "100-hours"})))
+        (begin
+          (map-set volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "100-hours"}
+            {
+              earned-at: stacks-block-height,
+              description: "Community Champion - 100+ hours of service",
+              hours-milestone: u100
+            })
+          (ok true))
+        (if (and (>= total-hours u200) (is-none (map-get? volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "200-hours"})))
+          (begin
+            (map-set volunteer-achievements {volunteer-id: volunteer-id, achievement-type: "200-hours"}
+              {
+                earned-at: stacks-block-height,
+                description: "Service Hero - 200+ hours of service",
+                hours-milestone: u200
+              })
+            (ok true))
+          (ok false))))))
+
+(define-read-only (get-volunteer (volunteer-id uint))
+  (map-get? volunteers volunteer-id))
+
+(define-read-only (get-volunteer-opportunity (opportunity-id uint))
+  (map-get? volunteer-opportunities opportunity-id))
+
+(define-read-only (get-volunteer-assignment (assignment-id uint))
+  (map-get? volunteer-assignments assignment-id))
+
+(define-read-only (get-volunteer-achievement (volunteer-id uint) (achievement-type (string-ascii 50)))
+  (map-get? volunteer-achievements {volunteer-id: volunteer-id, achievement-type: achievement-type}))
+
+(define-read-only (get-volunteer-stats (volunteer-id uint))
+  (match (map-get? volunteers volunteer-id)
+    volunteer (ok {
+      total-hours: (get total-hours volunteer),
+      assignments-count: (get assignments-count volunteer),
+      rating: (get rating volunteer),
+      background-checked: (get background-checked volunteer),
+      active: (get active volunteer)
+    })
+    err-not-found))
+
+(define-read-only (get-opportunity-stats (opportunity-id uint))
+  (match (map-get? volunteer-opportunities opportunity-id)
+    opportunity (ok {
+      current-volunteers: (get current-volunteers opportunity),
+      max-volunteers: (get max-volunteers opportunity),
+      available-spots: (- (get max-volunteers opportunity) (get current-volunteers opportunity)),
+      fill-rate: (/ (* (get current-volunteers opportunity) u100) (get max-volunteers opportunity)),
+      urgent: (get urgent opportunity),
+      active: (get active opportunity)
+    })
+    err-not-found))
 
 (define-read-only (get-shelter (shelter-id uint))
   (map-get? shelters shelter-id))
