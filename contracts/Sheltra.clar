@@ -8,6 +8,10 @@
 (define-constant err-shelter-full (err u106))
 (define-constant err-not-verified (err u107))
 (define-constant err-invalid-amount (err u108))
+(define-constant err-insufficient-inventory (err u109))
+(define-constant err-invalid-resource-type (err u110))
+(define-constant err-request-already-processed (err u111))
+(define-constant err-invalid-expiry (err u112))
 
 (define-data-var next-shelter-id uint u0)
 (define-data-var next-donor-id uint u0)
@@ -15,6 +19,9 @@
 (define-data-var next-volunteer-id uint u0)
 (define-data-var next-opportunity-id uint u0)
 (define-data-var next-volunteer-assignment-id uint u0)
+(define-data-var next-resource-id uint u0)
+(define-data-var next-resource-request-id uint u0)
+(define-data-var next-resource-transaction-id uint u0)
 (define-data-var total-donations uint u0)
 (define-data-var platform-fee-rate uint u25)
 
@@ -308,6 +315,60 @@
   }
 )
 
+(define-map shelter-resources
+  uint
+  {
+    shelter-id: uint,
+    resource-type: (string-ascii 50),
+    quantity: uint,
+    unit: (string-ascii 20),
+    expiry-date: (optional uint),
+    low-stock-threshold: uint,
+    last-updated: uint,
+    notes: (string-ascii 200)
+  }
+)
+
+(define-map resource-requests
+  uint
+  {
+    requesting-shelter-id: uint,
+    resource-type: (string-ascii 50),
+    quantity-needed: uint,
+    urgency-level: uint,
+    description: (string-ascii 300),
+    status: (string-ascii 20),
+    created-at: uint,
+    deadline: (optional uint),
+    fulfilled-by: (optional uint),
+    fulfilled-at: (optional uint)
+  }
+)
+
+(define-map resource-transactions
+  uint
+  {
+    from-shelter-id: (optional uint),
+    to-shelter-id: uint,
+    resource-id: uint,
+    quantity: uint,
+    transaction-type: (string-ascii 20),
+    created-at: uint,
+    notes: (string-ascii 300),
+    authorized-by: principal
+  }
+)
+
+(define-map resource-alerts
+  {shelter-id: uint, resource-type: (string-ascii 50)}
+  {
+    alert-type: (string-ascii 30),
+    triggered-at: uint,
+    resolved: bool,
+    resolved-at: (optional uint)
+  }
+)
+
 (define-public (register-volunteer
   (name (string-ascii 100))
   (email (string-ascii 100))
@@ -508,6 +569,292 @@
             (ok true))
           (ok false))))))
 
+(define-public (add-resource-to-inventory
+  (shelter-id uint)
+  (resource-type (string-ascii 50))
+  (quantity uint)
+  (unit (string-ascii 20))
+  (expiry-date (optional uint))
+  (low-stock-threshold uint)
+  (notes (string-ascii 200)))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found))
+        (resource-id (var-get next-resource-id)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (get verified shelter) err-not-verified)
+    (asserts! (> quantity u0) err-invalid-amount)
+    (asserts! (> low-stock-threshold u0) err-invalid-amount)
+    (match expiry-date
+      expiry (asserts! (> expiry stacks-block-height) err-invalid-expiry)
+      true)
+    (map-set shelter-resources resource-id
+      {
+        shelter-id: shelter-id,
+        resource-type: resource-type,
+        quantity: quantity,
+        unit: unit,
+        expiry-date: expiry-date,
+        low-stock-threshold: low-stock-threshold,
+        last-updated: stacks-block-height,
+        notes: notes
+      })
+    (var-set next-resource-id (+ resource-id u1))
+    (unwrap-panic (check-and-create-alerts shelter-id resource-type quantity low-stock-threshold))
+    (ok resource-id)))
+
+(define-public (update-resource-quantity
+  (resource-id uint)
+  (new-quantity uint)
+  (notes (string-ascii 200)))
+  (let ((resource (unwrap! (map-get? shelter-resources resource-id) err-not-found)))
+    (let ((shelter (unwrap! (map-get? shelters (get shelter-id resource)) err-not-found)))
+      (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+      (map-set shelter-resources resource-id
+        (merge resource {
+          quantity: new-quantity,
+          last-updated: stacks-block-height,
+          notes: notes
+        }))
+      (unwrap-panic (record-resource-transaction 
+        none 
+        (get shelter-id resource) 
+        resource-id 
+        (if (> new-quantity (get quantity resource))
+          (- new-quantity (get quantity resource))
+          (- (get quantity resource) new-quantity))
+        (if (> new-quantity (get quantity resource)) "restock" "consumption")
+        notes))
+      (unwrap-panic (check-and-create-alerts 
+        (get shelter-id resource) 
+        (get resource-type resource) 
+        new-quantity 
+        (get low-stock-threshold resource)))
+      (ok true))))
+
+(define-public (create-resource-request
+  (shelter-id uint)
+  (resource-type (string-ascii 50))
+  (quantity-needed uint)
+  (urgency-level uint)
+  (description (string-ascii 300))
+  (deadline (optional uint)))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found))
+        (request-id (var-get next-resource-request-id)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (get verified shelter) err-not-verified)
+    (asserts! (> quantity-needed u0) err-invalid-amount)
+    (asserts! (and (>= urgency-level u1) (<= urgency-level u5)) err-invalid-amount)
+    (match deadline
+      deadline-value (asserts! (> deadline-value stacks-block-height) err-invalid-expiry)
+      true)
+    (map-set resource-requests request-id
+      {
+        requesting-shelter-id: shelter-id,
+        resource-type: resource-type,
+        quantity-needed: quantity-needed,
+        urgency-level: urgency-level,
+        description: description,
+        status: "open",
+        created-at: stacks-block-height,
+        deadline: deadline,
+        fulfilled-by: none,
+        fulfilled-at: none
+      })
+    (var-set next-resource-request-id (+ request-id u1))
+    (ok request-id)))
+
+(define-public (fulfill-resource-request
+  (request-id uint)
+  (fulfilling-shelter-id uint)
+  (resource-id uint))
+  (let ((request (unwrap! (map-get? resource-requests request-id) err-not-found))
+        (resource (unwrap! (map-get? shelter-resources resource-id) err-not-found))
+        (fulfilling-shelter (unwrap! (map-get? shelters fulfilling-shelter-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner fulfilling-shelter)) err-unauthorized)
+    (asserts! (is-eq (get shelter-id resource) fulfilling-shelter-id) err-unauthorized)
+    (asserts! (is-eq (get status request) "open") err-request-already-processed)
+    (asserts! (is-eq (get resource-type resource) (get resource-type request)) err-invalid-resource-type)
+    (asserts! (>= (get quantity resource) (get quantity-needed request)) err-insufficient-inventory)
+    (let ((new-quantity (- (get quantity resource) (get quantity-needed request))))
+      (map-set shelter-resources resource-id
+        (merge resource {
+          quantity: new-quantity,
+          last-updated: stacks-block-height
+        }))
+      (map-set resource-requests request-id
+        (merge request {
+          status: "fulfilled",
+          fulfilled-by: (some fulfilling-shelter-id),
+          fulfilled-at: (some stacks-block-height)
+        }))
+      (unwrap-panic (record-resource-transaction
+        (some fulfilling-shelter-id)
+        (get requesting-shelter-id request)
+        resource-id
+        (get quantity-needed request)
+        "transfer"
+        (get description request)))
+      (unwrap-panic (check-and-create-alerts 
+        fulfilling-shelter-id 
+        (get resource-type resource) 
+        new-quantity 
+        (get low-stock-threshold resource)))
+      (ok true))))
+
+(define-public (transfer-resource-between-shelters
+  (from-shelter-id uint)
+  (to-shelter-id uint)
+  (resource-id uint)
+  (transfer-quantity uint)
+  (notes (string-ascii 200)))
+  (let ((resource (unwrap! (map-get? shelter-resources resource-id) err-not-found))
+        (from-shelter (unwrap! (map-get? shelters from-shelter-id) err-not-found))
+        (to-shelter (unwrap! (map-get? shelters to-shelter-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner from-shelter)) err-unauthorized)
+    (asserts! (is-eq (get shelter-id resource) from-shelter-id) err-unauthorized)
+    (asserts! (get verified to-shelter) err-not-verified)
+    (asserts! (> transfer-quantity u0) err-invalid-amount)
+    (asserts! (>= (get quantity resource) transfer-quantity) err-insufficient-inventory)
+    (let ((new-quantity (- (get quantity resource) transfer-quantity))
+          (to-resource-id (var-get next-resource-id)))
+      (map-set shelter-resources resource-id
+        (merge resource {
+          quantity: new-quantity,
+          last-updated: stacks-block-height
+        }))
+      (map-set shelter-resources to-resource-id
+        {
+          shelter-id: to-shelter-id,
+          resource-type: (get resource-type resource),
+          quantity: transfer-quantity,
+          unit: (get unit resource),
+          expiry-date: (get expiry-date resource),
+          low-stock-threshold: (get low-stock-threshold resource),
+          last-updated: stacks-block-height,
+          notes: notes
+        })
+      (var-set next-resource-id (+ to-resource-id u1))
+      (unwrap-panic (record-resource-transaction
+        (some from-shelter-id)
+        to-shelter-id
+        resource-id
+        transfer-quantity
+        "transfer"
+        notes))
+      (unwrap-panic (check-and-create-alerts 
+        from-shelter-id 
+        (get resource-type resource) 
+        new-quantity 
+        (get low-stock-threshold resource)))
+      (ok to-resource-id))))
+
+(define-public (mark-resource-expired
+  (resource-id uint))
+  (let ((resource (unwrap! (map-get? shelter-resources resource-id) err-not-found)))
+    (let ((shelter (unwrap! (map-get? shelters (get shelter-id resource)) err-not-found)))
+      (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+      (match (get expiry-date resource)
+        expiry (asserts! (<= expiry stacks-block-height) err-invalid-expiry)
+        (asserts! false err-not-found))
+      (map-set shelter-resources resource-id
+        (merge resource {
+          quantity: u0,
+          last-updated: stacks-block-height,
+          notes: "Marked as expired"
+        }))
+      (unwrap-panic (record-resource-transaction
+        none
+        (get shelter-id resource)
+        resource-id
+        (get quantity resource)
+        "expired"
+        "Resource marked as expired"))
+      (ok true))))
+
+(define-public (resolve-resource-alert
+  (shelter-id uint)
+  (resource-type (string-ascii 50)))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (let ((alert-key {shelter-id: shelter-id, resource-type: resource-type}))
+      (match (map-get? resource-alerts alert-key)
+        alert (begin
+          (map-set resource-alerts alert-key
+            (merge alert {
+              resolved: true,
+              resolved-at: (some stacks-block-height)
+            }))
+          (ok true))
+        err-not-found))))
+
+(define-private (record-resource-transaction
+  (from-shelter-id (optional uint))
+  (to-shelter-id uint)
+  (resource-id uint)
+  (quantity uint)
+  (transaction-type (string-ascii 20))
+  (notes (string-ascii 300)))
+  (let ((transaction-id (var-get next-resource-transaction-id)))
+    (map-set resource-transactions transaction-id
+      {
+        from-shelter-id: from-shelter-id,
+        to-shelter-id: to-shelter-id,
+        resource-id: resource-id,
+        quantity: quantity,
+        transaction-type: transaction-type,
+        created-at: stacks-block-height,
+        notes: notes,
+        authorized-by: tx-sender
+      })
+    (var-set next-resource-transaction-id (+ transaction-id u1))
+    (ok transaction-id)))
+
+(define-private (check-and-create-alerts
+  (shelter-id uint)
+  (resource-type (string-ascii 50))
+  (current-quantity uint)
+  (threshold uint))
+  (let ((alert-key {shelter-id: shelter-id, resource-type: resource-type}))
+    (if (<= current-quantity threshold)
+      (begin
+        (map-set resource-alerts alert-key
+          {
+            alert-type: "low-stock",
+            triggered-at: stacks-block-height,
+            resolved: false,
+            resolved-at: none
+          })
+        (ok true))
+      (ok false))))
+
+(define-read-only (get-resource (resource-id uint))
+  (map-get? shelter-resources resource-id))
+
+(define-read-only (get-resource-request (request-id uint))
+  (map-get? resource-requests request-id))
+
+(define-read-only (get-resource-transaction (transaction-id uint))
+  (map-get? resource-transactions transaction-id))
+
+(define-read-only (get-resource-alert (shelter-id uint) (resource-type (string-ascii 50)))
+  (map-get? resource-alerts {shelter-id: shelter-id, resource-type: resource-type}))
+
+(define-read-only (get-shelter-inventory-summary (shelter-id uint))
+  (let ((resource-ids (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)))
+    (ok {
+      total-resources: (var-get next-resource-id),
+      low-stock-count: u0,
+      expired-count: u0,
+      last-updated: stacks-block-height
+    })))
+
+(define-read-only (get-resource-stats (resource-type (string-ascii 50)))
+  (ok {
+    total-shelters-with-resource: u0,
+    total-quantity: u0,
+    average-stock-level: u0,
+    total-requests: u0
+  }))
+
 (define-read-only (get-volunteer (volunteer-id uint))
   (map-get? volunteers volunteer-id))
 
@@ -589,3 +936,5 @@
       funding-percentage: (/ (* (get funding-received shelter) u100) (get funding-goal shelter))
     })
     err-not-found))
+
+
