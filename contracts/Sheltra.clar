@@ -12,6 +12,9 @@
 (define-constant err-invalid-resource-type (err u110))
 (define-constant err-request-already-processed (err u111))
 (define-constant err-invalid-expiry (err u112))
+(define-constant err-invalid-priority (err u113))
+(define-constant err-emergency-active (err u114))
+(define-constant err-no-emergency (err u115))
 
 (define-data-var next-shelter-id uint u0)
 (define-data-var next-donor-id uint u0)
@@ -366,6 +369,20 @@
     triggered-at: uint,
     resolved: bool,
     resolved-at: (optional uint)
+  }
+)
+
+;; Emergency Status System - allows shelters to broadcast urgent situations
+(define-map emergency-status
+  uint
+  {
+    emergency-type: (string-ascii 20),
+    priority: uint,
+    message: (string-ascii 300),
+    declared-at: uint,
+    resolved: bool,
+    resolved-at: (optional uint),
+    contact-override: (optional (string-ascii 100))
   }
 )
 
@@ -937,4 +954,86 @@
     })
     err-not-found))
 
+;; Emergency Status Management Functions
+(define-public (declare-emergency
+  (shelter-id uint)
+  (emergency-type (string-ascii 20))
+  (priority uint)
+  (message (string-ascii 300))
+  (contact-override (optional (string-ascii 100))))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (get verified shelter) err-not-verified)
+    (asserts! (and (>= priority u1) (<= priority u5)) err-invalid-priority)
+    (asserts! (is-none (map-get? emergency-status shelter-id)) err-emergency-active)
+    (map-set emergency-status shelter-id
+      {
+        emergency-type: emergency-type,
+        priority: priority,
+        message: message,
+        declared-at: stacks-block-height,
+        resolved: false,
+        resolved-at: none,
+        contact-override: contact-override
+      })
+    (ok true)))
+
+(define-public (resolve-emergency (shelter-id uint))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found))
+        (emergency (unwrap! (map-get? emergency-status shelter-id) err-no-emergency)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (not (get resolved emergency)) err-no-emergency)
+    (map-set emergency-status shelter-id
+      (merge emergency {
+        resolved: true,
+        resolved-at: (some stacks-block-height)
+      }))
+    (ok true)))
+
+(define-public (update-emergency-message
+  (shelter-id uint)
+  (new-message (string-ascii 300)))
+  (let ((shelter (unwrap! (map-get? shelters shelter-id) err-not-found))
+        (emergency (unwrap! (map-get? emergency-status shelter-id) err-no-emergency)))
+    (asserts! (is-eq tx-sender (get owner shelter)) err-unauthorized)
+    (asserts! (not (get resolved emergency)) err-no-emergency)
+    (map-set emergency-status shelter-id
+      (merge emergency {message: new-message}))
+    (ok true)))
+
+;; Emergency Status Query Functions
+(define-read-only (get-emergency-status (shelter-id uint))
+  (map-get? emergency-status shelter-id))
+
+(define-read-only (get-active-emergencies)
+  (let ((shelter-list (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19)))
+    (ok (filter is-emergency-active shelter-list))))
+
+(define-read-only (get-high-priority-emergencies)
+  (let ((shelter-list (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19)))
+    (ok (filter is-high-priority-emergency shelter-list))))
+
+(define-read-only (get-emergency-summary (shelter-id uint))
+  (match (get-emergency-status shelter-id)
+    emergency (some {
+      shelter-id: shelter-id,
+      emergency-type: (get emergency-type emergency),
+      priority: (get priority emergency),
+      message: (get message emergency),
+      hours-since-declared: (- stacks-block-height (get declared-at emergency)),
+      resolved: (get resolved emergency),
+      shelter-info: (unwrap-panic (get-shelter shelter-id))
+    })
+    none))
+
+;; Private helper functions for emergency filtering
+(define-private (is-emergency-active (shelter-id uint))
+  (match (map-get? emergency-status shelter-id)
+    emergency (not (get resolved emergency))
+    false))
+
+(define-private (is-high-priority-emergency (shelter-id uint))
+  (match (map-get? emergency-status shelter-id)
+    emergency (and (>= (get priority emergency) u4) (not (get resolved emergency)))
+    false))
 
